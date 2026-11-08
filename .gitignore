@@ -1,0 +1,6 @@
+.pio/
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+firmware/include/secrets.h
+*.csv
