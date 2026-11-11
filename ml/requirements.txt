@@ -3,3 +3,5 @@ statsforecast==2.1.1
 chronos-forecasting==2.3.2
 matplotlib==3.11.2
 ipykernel==7.4.0
+lightgbm==4.7.0
+keras==3.15.1

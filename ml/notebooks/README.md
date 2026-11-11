@@ -265,3 +265,101 @@ Razones: Chronos no cabe en un ESP32 (que tiene unos pocos MB de memoria), y pre
 3. **Convertir la sección 7 del notebook en un script** (`ml/forecast.py`) que la Raspberry Pi corra todos los días (con cron o con una automatización de Home Assistant) y publique un sensor por producto, por ejemplo `sensor.pronostico_arroz_7d`, con la P50 y la P90 como atributos, vía la API REST de Home Assistant o MQTT.
    Ojo: en el notebook, `total_p90` es la **suma de los P90 de cada día**, no el P90 de la semana. Como los errores diarios se compensan en parte, esa suma es más alta: es un número conservador para reabastecer.
 4. **El agente de Ollama** lee esos sensores y responde preguntas en lenguaje natural.
+
+---
+---
+
+# Parte 2 · Notebook 02: modelos entrenados por nosotros
+
+`02_comparacion_2017.ipynb` agrega dos modelos que **entrenamos nosotros** (LightGBM y una red neuronal pequeña) y los pone a competir contra Naive semanal y Chronos con un examen más grande.
+
+## 11. Qué cambia respecto al notebook 01
+
+| | Notebook 01 | Notebook 02 |
+|---|---|---|
+| Examen | 4 semanas (diciembre 2017) | **52 semanas (todo 2017)** |
+| Partición | todo lo anterior a cada corte | **por años**: entrenar 2014–2015, validar 2016, probar 2017 |
+| Modelos | 4 de librería | Naive, Chronos + **2 entrenados por nosotros** |
+| Fuera | – | AutoETS (tardaría horas en 52 semanas) y Promedio 4 semanas (fue el peor en el 01) |
+
+Las 4 últimas semanas del examen son **las mismas del notebook 01**. Por eso el notebook imprime un control: el MAE del naive en diciembre debe dar **8.74**, igual que en el 01. Ya lo verifiqué: da 8.74.
+
+## 12. Orígenes: cómo se arma cada ejemplo
+
+Un **origen** es "el último día que conocemos". Con los datos hasta ese día se predicen los 7 siguientes. Es lo mismo que hará el sistema real: cada día, "hoy" es el origen.
+
+| Parte | Orígenes | Ejemplos (orígenes × 500 productos) |
+|---|---|---|
+| Entrenamiento | cada día de 2014–2015 (697) | 348,500 |
+| Validación | cada día de 2016 (360) | 180,000 |
+| Prueba | uno por semana de 2017 (52) | 26,000 |
+
+El entrenamiento empieza a fines de enero de 2014, y no en 2013, porque cada ejemplo necesita 28 días recientes **más un año** de historia para la pista "hace un año".
+
+Ningún objetivo de entrenamiento cae en 2016 y ninguno de validación cae en 2017. El notebook lo comprueba con un `assert`.
+
+## 13. Las 42 pistas y por qué cada una
+
+| Pistas | Cuántas | Por qué |
+|---|---|---|
+| **Últimos 28 días** ÷ escala | 28 | El nivel actual y el patrón semanal reciente. |
+| **La misma semana hace un año** ÷ el promedio de las 4 semanas previas de ese año | 7 | Es la única forma de ver el **patrón anual** (lo que les faltó a los modelos simples en diciembre). Le dice al modelo "el año pasado, esta semana fue 0.75 veces lo normal". |
+| **Día de la semana** del primer día a predecir | 7 | Para que sepa en qué posición cae el sábado. Va como siete 0/1 (*one-hot*). |
+
+**Escala** = promedio de los últimos 28 días del producto. Todo se divide entre ella, y la predicción se multiplica de vuelta al final.
+
+**Lo que NO le damos, a propósito:**
+- **El nombre o número del producto.** Si lo tuviera, aprendería "el producto 15 vende 60", y eso no sirve en tu almacén.
+- **La fecha del año** (mes, día del año). Aprendería el calendario de *este* dataset de Kaggle. "Hace un año" en cambio funciona con el calendario de cualquier negocio.
+
+Con esas dos decisiones, el modelo aprende **formas** y no tamaños ni fechas, y por eso se puede aplicar a **cualquier inventario**.
+
+**Atajo conocido:** si un producto vende menos de 1 unidad por día en promedio, no se normaliza (se divide entre 1). Está marcado en el código con `shortcut:`. Hay que revisarlo con tus datos reales si tienes productos de venta muy esporádica.
+
+## 14. Diseño de LightGBM
+
+- **7 modelos**, uno por cada día a predecir (día 1 … día 7). Es la forma más simple de que LightGBM, que predice un solo número, entregue 7. Se guardan en `ml/models/lightgbm_dia1.txt` … `lightgbm_dia7.txt`.
+- **`objective="l1"`**: minimiza el error absoluto, y eso lleva a predecir la **mediana (P50)**, lo mismo que comparamos de Chronos.
+
+| Perilla | Valor | Qué controla |
+|---|---|---|
+| `learning_rate` | 0.05 | Cuánto corrige cada árbol nuevo. Más bajo: aprende más lento pero más fino. |
+| `num_leaves` | 31 | Qué tan complejo puede ser cada árbol. |
+| `min_data_in_leaf` | 200 | Cada decisión final debe apoyarse en al menos 200 ejemplos. Evita que memorice casos raros. |
+| `feature_fraction` | 0.8 | Cada árbol ve el 80% de las pistas al azar. Otra defensa contra memorizar. |
+
+- **Early stopping (aquí se usa la validación):** agrega árboles mientras mejore en 2016. Si pasan 50 rondas sin mejorar, para. El notebook imprime cuántos árboles quedaron por día.
+- **Reentrenamiento final:** con el número de árboles elegido, se entrena otra vez con 2014–2016, para que también aprenda de 2016.
+
+## 15. Diseño de la red neuronal
+
+```
+42 pistas → [64 neuronas, ReLU] → [32 neuronas, ReLU] → 7 salidas (día 1 … día 7)
+```
+
+- **Parámetros:** (42×64 + 64) + (64×32 + 32) + (32×7 + 7) = **5,063**. Son unos 20 KB en float32 y unos 5 KB en int8: cabe de sobra en el ESP32-S3.
+- **¿Por qué un MLP (capas densas) y no LSTM u otra red más "de series de tiempo"?** Con 42 pistas ya preparadas, un MLP alcanza. Además, TensorFlow Lite Micro soporta las capas densas sin problemas, mientras que el soporte de LSTM en microcontroladores es limitado. Y es la red más fácil de explicar.
+- **`loss="mae"`**: igual que LightGBM, aprende la mediana.
+- **Adam con `learning_rate=1e-3`, `batch_size=512`**: valores estándar para empezar.
+- **Early stopping con `patience=5`:** si el error en 2016 no mejora en 5 épocas, para y se queda con la mejor. Luego se reentrena **desde cero** con 2014–2016 durante esas mismas épocas.
+- **Curva de aprendizaje:** el notebook la dibuja. Si la línea de validación sube mientras la de entrenamiento baja, la red está memorizando (*overfitting*).
+- **Keras sobre PyTorch:** Keras puede funcionar sobre PyTorch o sobre TensorFlow. Uso PyTorch porque ya está instalado (lo trajo Chronos) y así no instalamos TensorFlow (~400 MB) todavía. El archivo `ml/models/red.keras` sirve para los dos, y el **notebook 03** lo abrirá con TensorFlow para convertirlo a int8. Ya comprobé que TensorFlow 2.21 se instala en tu Python 3.13.
+
+## 16. Lo que quedó fuera en esta versión
+
+- **P90 de LightGBM y de la red:** por ahora solo predicen la mediana. Para que den P90 se entrenan con `objective="quantile"` (LightGBM) o con una pérdida *pinball* (la red). Es el siguiente paso si la comparación lo pide.
+- **Afinar perillas:** usé valores estándar. Si LightGBM o la red quedan cerca de Chronos, vale la pena probar otras combinaciones contra la validación de 2016 (nunca contra 2017).
+
+## 17. Cómo correrlo
+
+1. Pon `PRUEBA_RAPIDA = True` en la primera celda de código y dale a **Run All**. Usa 20 productos y entrenamientos cortos, y en tu PC tardó **3.5 minutos**. Sirve para comprobar que todo funciona.
+2. Vuelve a `PRUEBA_RAPIDA = False` y corre todo otra vez.
+   - Chronos tarda **~42 segundos por semana** con los 500 productos, así que **~36 minutos** las 52 semanas.
+   - LightGBM y la red no los he medido con los 500 productos; estimo de 10 a 20 minutos entre los dos.
+   - En total, **alrededor de una hora**.
+
+Los modelos entrenados quedan en `ml/models/`.
+
+## 18. Resultados
+
+_Pendiente: se llenan después de la corrida completa._ Los números de la prueba rápida no se anotan: con 20 productos y 2 épocas no significan nada.
