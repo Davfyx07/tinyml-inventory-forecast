@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 firmware/include/secrets.h
 *.csv
+
+# Modelos LightGBM (8.9 MB por versión, se regeneran con el notebook 02); red.keras sí se versiona
+ml/models/**/lightgbm_*.txt

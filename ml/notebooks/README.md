@@ -1,225 +1,351 @@
-# Pronóstico de consumo a 7 días: explicación completa
+# Pronóstico de consumo de inventario a 7 días
 
-Este documento explica qué hace el notebook `01_pronostico_7_dias.ipynb`, de dónde salen los datos, qué es cada modelo, por qué lo elegí y cómo leer los resultados.
+Documentación técnica de los experimentos contenidos en `ml/notebooks/`.
 
----
-
-## 1. El problema en una frase
-
-> Con el historial de cuántas unidades de cada producto salieron por día, predecir cuántas van a salir en los **próximos 7 días**.
-
-En el proyecto completo:
-
-```
-ESP32-S3 (cámara + TinyML)  →  registra salidas de productos
-        ↓
-Base de datos / Home Assistant  →  guarda el historial
-        ↓
-Servicio Python en la Raspberry Pi  →  ESTE PRONÓSTICO (1 vez al día)
-        ↓
-Home Assistant (sensores)  →  el agente de Ollama responde "¿cuánto arroz necesito esta semana?"
-```
-
-Este notebook es la parte del **servicio Python**: elige qué modelo usar y demuestra que funciona.
-
----
-
-## 2. Los datos: qué es eso de Kaggle
-
-**Kaggle** es una plataforma de Google donde se publican datasets y competencias de ciencia de datos. Las empresas o la misma plataforma suben un problema con datos y la gente compite por resolverlo mejor.
-
-El dataset que bajaste es de la competencia **"Store Item Demand Forecasting Challenge"**. Su identificador en Kaggle es `demand-forecasting-kernels-only`: "kernels only" significa que en la competencia solo se podía participar con notebooks dentro de Kaggle. Para nosotros eso no importa.
-
-### Los 3 archivos que bajaste
-
-| Archivo | Qué tiene | ¿Lo usamos? |
+| Notebook | Contenido | Estado |
 |---|---|---|
-| `train.csv` | Ventas diarias reales: `date, store, item, sales` | **Sí, es el único que sirve** |
-| `test.csv` | Fechas de 2018 **sin ventas** (Kaggle las escondió para calificar) | No: sin la respuesta no podemos medir nada |
-| `sample_submission.csv` | Ejemplo del formato para enviar respuestas a la competencia | No |
+| `01_pronostico_7_dias.ipynb` | Experimento 1: modelos de referencia, evaluados en 4 semanas de diciembre de 2017 | Ejecutado |
+| `02_comparacion_2017.ipynb` | Experimento 2: modelos entrenados (LightGBM y MLP), evaluados en las 52 semanas de 2017 | Ejecutado |
 
-### Qué hay en `train.csv`
+**Versión documentada: v0.1** (primer entrenamiento). Los resultados, las figuras y los modelos descritos en este documento corresponden a esta versión:
 
-- **10 tiendas × 50 productos = 500 series de tiempo** (cada combinación tienda+producto es una serie).
-- **5 años diarios**: del 2013-01-01 al 2017-12-31.
-- **913,000 filas**. Ventas por día entre 0 y 231 unidades (mediana: 47).
-- Sin huecos y casi sin días en cero (0.0001%).
-
-### ¿Por qué este dataset y no datos inventados por mí?
-
-- **Es exactamente tu problema**: unidades por producto por día.
-- **No lo hiciste tú.** Si generas datos con tus propias reglas ("los sábados se vende 20% más"), el modelo aprende tus reglas y el resultado "bueno" no demuestra nada. Con datos ajenos no puedes hacer trampa sin querer.
-- **Es un benchmark conocido**: mucha gente lo ha usado, así que tus resultados se pueden comparar.
-
-**Ojo:** es un dataset de práctica, muy limpio (sin agotados, sin huecos, sin productos nuevos). Los datos de tu almacén real serán más ruidosos. Por eso el método de evaluación (backtesting) es más importante que el modelo: cuando tengas datos reales, corres la misma comparación y ves cuál gana.
-
-### Cómo conseguir el archivo
-
-El notebook lee `ml/data/train.csv`, que ya está copiado. Si clonas el repo en otra máquina, el CSV **no está en git** (el `.gitignore` ignora `*.csv`), así que hay dos opciones:
-
-1. **Manual:** descargarlo de la página de la competencia en Kaggle y copiar `train.csv` a `ml/data/`.
-2. **Con código** (el snippet que encontraste):
-   ```python
-   import kagglehub
-   path = kagglehub.competition_download('demand-forecasting-kernels-only')
-   print(path)  # copia train.csv de esa carpeta a ml/data/
-   ```
-   Para esto necesitas cuenta de Kaggle, tu API token configurado y haber aceptado las reglas de la competencia en su página web.
-
----
-
-## 3. Conceptos que necesitas antes de ver los modelos
-
-### Serie de tiempo
-Una secuencia de valores ordenados por fecha. Aquí: "ventas de producto 1 en tienda 1, día por día".
-
-### Horizonte (`H = 7`)
-Cuántos días hacia adelante predecimos. La tarea pide 7.
-
-### Estacionalidad semanal (`season_length = 7`)
-Un patrón que se repite cada 7 días. En el notebook (sección 2) se ve claramente: **los fines de semana se vende mucho más que los lunes**. Por eso todos los modelos reciben `season_length=7`: les decimos "busca patrones que se repiten cada semana".
-
-### Backtesting (validación cruzada temporal)
-Es la pieza más importante del notebook. La idea:
-
-```
-Historial: ════════════════════════════════════════╪═══════╪═══════╪═══════╪═══════╡
-                                                  corte1  corte2  corte3  corte4  fin 2017
-En el corte 1:  el modelo solo ve ════════════════╡ y predice los 7 días siguientes
-                luego comparamos contra lo que pasó de verdad.
-Repetimos en los 4 cortes (las últimas 4 semanas de 2017).
-```
-
-**¿Por qué no un train/test aleatorio como en otros problemas de ML?** Porque si mezclas fechas al azar, el modelo podría "ver" el martes para predecir el lunes anterior: estaría usando el futuro. En la vida real nunca tienes el futuro, así que la evaluación tampoco debe tenerlo.
-
-**¿Por qué 4 cortes y no 1?** Una sola semana puede ser rara (un feriado, por ejemplo). Con 4 semanas el resultado es más confiable.
-
-### Métricas
-
-| Métrica | Fórmula simple | Cómo leerla |
-|---|---|---|
-| **MAE** (error absoluto medio) | promedio de \|predicción − real\| | "En promedio me equivoco por X unidades al día, por producto". En unidades: fácil de explicar. |
-| **WAPE** (error porcentual ponderado) | suma de errores ÷ suma de ventas reales | "Me equivoco en X% de lo que se vende". Sirve para comparar productos que venden mucho con los que venden poco. |
-| **Sesgo** | suma de (predicción − real) ÷ suma de ventas | Positivo: predice de más (sobra inventario). Negativo: predice de menos (te quedas sin stock). |
-| **WAPE semanal** | igual que WAPE, pero sumando primero los 7 días | Para reabastecer importa el total de la semana, y los errores diarios se compensan en parte. |
-| **Cobertura P90** | % de días en que lo real ≤ P90 | Si el P90 está bien hecho, debe ser cerca de 90%. |
-
-### Cuantiles: P10, P50, P90
-En vez de dar un solo número, el modelo da un rango:
-
-- **P50 (mediana):** el valor más probable. La mitad de las veces se vende más y la mitad, menos.
-- **P90:** el 90% de las veces se venderá **menos** que esto. Es el número "seguro" para reabastecer.
-- **P10:** el 10% de las veces se venderá menos que esto.
-
-**¿Por qué importa?** Si te pregunta el dueño del almacén "¿cuánto arroz pido?", responder con el P50 hace que te quedes corto la mitad de las semanas. Con el P90 te quedas corto 1 de cada 10.
-
----
-
-## 4. Los modelos: qué es cada uno y por qué está ahí
-
-Van **del más simple al más complejo**. La regla es: un modelo complejo solo vale la pena si le gana a los simples.
-
-### 4.1 `Naive_semanal` (SeasonalNaive)
-**Qué hace:** "la próxima semana va a ser igual que la semana pasada". El lunes que viene = el lunes pasado, y así con cada día.
-
-**Por qué está:** es el **piso mínimo**. No necesita entrenamiento ni matemáticas. Si un modelo sofisticado no le gana a esto, no sirve. En inventario, este método es sorprendentemente difícil de superar.
-
-### 4.2 `Promedio_4_semanas` (SeasonalWindowAverage)
-**Qué hace:** el próximo lunes = promedio de los últimos 4 lunes. Igual con cada día de la semana.
-
-**Por qué está:** corrige el problema del naive. Si la semana pasada fue rara (un feriado, una promoción), el naive la copia tal cual; el promedio de 4 semanas la suaviza. Sigue siendo fácil de explicar en una frase.
-
-### 4.3 `AutoETS` (suavizado exponencial)
-**Qué hace:** ETS = **E**rror, **T**rend (tendencia), **S**easonality (estacionalidad). Es un modelo estadístico clásico que separa la serie en tres partes:
-- **Nivel:** cuánto se vende "normalmente" ahora.
-- **Tendencia:** si las ventas suben o bajan con el tiempo.
-- **Estacionalidad:** el patrón semanal.
-
-"Exponencial" significa que los datos recientes pesan más que los viejos. "Auto" significa que **prueba varias combinaciones** (con o sin tendencia, estacionalidad que suma o que multiplica…) y para cada producto elige la que mejor ajusta.
-
-**Por qué está:** es el estándar de la industria desde hace décadas. Se entrena en milisegundos, corre en cualquier lado (incluida la Pi) y sus resultados se pueden explicar.
-
-### 4.4 `Chronos` (Chronos-Bolt small, de Amazon)
-**Qué hace:** es un **"foundation model"** de series de tiempo, algo así como un "ChatGPT de series de tiempo". Amazon lo preentrenó con muchísimas series de tiempo de todo tipo (ventas, clima, tráfico, energía…). Aprendió patrones generales, así que le das el historial de tu producto y predice **sin que lo entrenes** (eso se llama *zero-shot*).
-
-**Por qué está:** es la opción "moderna" que propusiste. La metimos en la comparación para que tú decidas con datos y no por moda. Ventajas que tiene:
-- **No hay que entrenarlo.**
-- **Da cuantiles (P10/P50/P90) de forma nativa.**
-- **Funciona con poco historial**, lo cual sirve cuando el sistema recién se instala y casi no hay datos (lo que se conoce como "arranque en frío").
-- La versión `small` tiene ~48 millones de parámetros y corre en CPU: en la Raspberry Pi es viable si corre una vez al día.
-
-**¿Por qué no lo reentrenamos (fine-tuning)?** Ya viene entrenado. Reentrenarlo necesita muchos datos reales y una GPU. Si lo reentrenas con datos inventados, solo aprende tus reglas inventadas. Primero hay que ver si sin entrenar ya es suficiente.
-
-### Lo que dejé fuera y por qué
-
-| Modelo | Por qué no está |
+| Artefacto | Ubicación |
 |---|---|
-| **Croston / TSB** | Son para productos que se venden de vez en cuando (muchos días en cero). En este dataset solo el 0.0001% de los días tiene cero ventas, así que no aportan. **En tu almacén real sí podrían servir** (por ejemplo, para repuestos que se venden una vez al mes). Están en la misma librería: `from statsforecast.models import CrostonOptimized`. |
-| **LightGBM / XGBoost** | Necesitan construir variables a mano (ventas de hace 7 días, promedios, día de la semana, feriados…). Es más trabajo y vale la pena solo si los anteriores no alcanzan. |
-| **Chronos-2** | Es la versión más nueva y grande de Chronos (acepta variables extra como feriados o promociones). Es más pesada para la Pi. Si quieres probarla, la librería ya la trae instalada. |
-| **Redes neuronales en el ESP32 (TinyML)** | Ver la sección 8. |
+| Figuras | `ml/notebooks/figuras/v0.1/` |
+| MLP entrenado | `ml/models/v0.1/red.keras` (versionado en el repositorio) |
+| Modelos LightGBM | `ml/models/v0.1/lightgbm_dia1.txt` … `lightgbm_dia7.txt` (excluidos del repositorio por tamaño; se regeneran ejecutando el notebook 02) |
+
+Las versiones posteriores guardarán sus artefactos en carpetas propias (`v0.2/`, …), definidas por la constante `VERSION` del notebook 02.
 
 ---
 
-## 5. Resultados
+## 1. Objetivo y alcance
 
-Backtesting de las 4 últimas semanas de 2017 (del 4 al 31 de diciembre), con los 500 productos. Son 14,000 predicciones diarias por modelo.
+Estimar el número de unidades de cada producto que se consumirán en los siguientes 7 días a partir del historial de salidas de inventario.
 
-### Error diario
+Ubicación del módulo dentro del sistema:
+
+```
+ESP32-S3 (cámara, TinyML)         registro de salidas de productos
+        ↓
+Base de datos / Home Assistant    almacenamiento del historial
+        ↓
+Servicio Python (Raspberry Pi)    pronóstico diario a 7 días        ← este módulo
+        ↓
+Home Assistant (sensores)         consulta por el agente conversacional (Ollama)
+```
+
+Los notebooks cubren la selección y validación del modelo. El servicio de producción (`ml/forecast.py`) se desarrollará en una etapa posterior.
+
+---
+
+## 2. Datos
+
+### 2.1 Fuente
+
+Competencia *Store Item Demand Forecasting Challenge* de Kaggle (identificador `demand-forecasting-kernels-only`; "kernels only" indica que la competencia solo admitía envíos generados desde notebooks de Kaggle).
+
+| Archivo | Contenido | Uso |
+|---|---|---|
+| `train.csv` | Ventas diarias observadas (`date, store, item, sales`), del 2013-01-01 al 2017-12-31 | Único archivo utilizado |
+| `test.csv` | 45,000 combinaciones fecha-tienda-producto del 2018-01-01 al 2018-03-31, sin ventas | No utilizado: no incluye valores observados |
+| `sample_submission.csv` | Formato de envío a la competencia (valor constante 52) | No utilizado |
+
+### 2.2 Características
+
+- 10 tiendas × 50 productos = 500 series diarias de 1,826 días cada una (913,000 registros).
+- Ventas entre 0 y 231 unidades/día (mediana: 47).
+- Sin fechas faltantes; el 0.0001% de los días registra venta cero.
+- Estacionalidad semanal (mayor venta en fin de semana) y anual (máximo en julio, ~67 unidades/día en promedio; mínimo en enero, ~35).
+
+![Exploración del conjunto de datos](figuras/v0.1/01_exploracion.png)
+
+*Figura 1. Izquierda: ventas diarias de una serie en los últimos 120 días. Derecha: venta media por día de la semana (500 series).*
+
+### 2.3 Justificación
+
+- Corresponde al problema planteado: unidades por producto y por día.
+- Es un conjunto externo y de referencia pública. Evaluar con datos generados según reglas propias introduciría un sesgo: el modelo aprendería las reglas del generador.
+- **Limitación:** es un conjunto limpio (sin quiebres de stock, huecos ni productos nuevos). Los datos reales presentarán mayor ruido; por ello la metodología de evaluación se diseñó para reutilizarse con datos propios.
+
+### 2.4 Obtención
+
+El archivo se ubica en `ml/data/train.csv` y está excluido del repositorio (`.gitignore`: `*.csv`). Puede descargarse desde la página de la competencia o con `kagglehub`, que requiere cuenta de Kaggle, token de API y aceptación de las reglas de la competencia:
+
+```python
+import kagglehub
+path = kagglehub.competition_download('demand-forecasting-kernels-only')
+```
+
+---
+
+## 3. Metodología de evaluación
+
+### 3.1 Definiciones
+
+- **Serie de tiempo:** ventas diarias de un producto en una tienda.
+- **Horizonte (H = 7):** número de días pronosticados.
+- **Estacionalidad semanal (`season_length = 7`):** patrón que se repite cada 7 días.
+- **Origen o corte:** último día con información disponible al momento de pronosticar.
+
+### 3.2 Backtesting
+
+La evaluación se realiza mediante validación temporal (*backtesting*): en cada corte, el modelo utiliza únicamente los datos anteriores y pronostica los 7 días siguientes, que luego se comparan con los valores observados.
+
+No se emplea una partición aleatoria porque permitiría al modelo usar información posterior a la fecha pronosticada (fuga de información), lo que sobrestima su desempeño. Se utilizan varios cortes para reducir la influencia de semanas atípicas.
+
+### 3.3 Métricas
+
+| Métrica | Definición | Unidad | Propósito |
+|---|---|---|---|
+| MAE | media de \|ŷ − y\| | unidades/día | Error en unidades, de interpretación directa. Depende del volumen de cada serie. |
+| WAPE | Σ\|ŷ − y\| / Σy | % | Error relativo, comparable entre series y conjuntos de datos; pondera por volumen. Se prefiere sobre el MAPE, que se indefine cuando y = 0. |
+| Sesgo | Σ(ŷ − y) / Σy | % | Dirección del error: positivo indica sobreestimación (exceso de inventario); negativo, subestimación (quiebre de stock). |
+| WAPE semanal | WAPE calculado sobre totales de 7 días | % | Error en la escala de la decisión de reabastecimiento. |
+| Cobertura P90 | % de días con y ≤ P90 | % (objetivo ≈ 90%) | Calibración del cuantil superior. |
+| Cobertura P10–P90 | % de días con P10 ≤ y ≤ P90 | % (objetivo ≈ 80%) | Calibración del ancho del intervalo. |
+
+### 3.4 Pronóstico probabilístico
+
+Un cuantil Pq es el valor por debajo del cual se espera que quede la demanda con probabilidad q. El P50 corresponde a la mediana; el P90 es el valor que la demanda no supera en el 90% de los casos.
+
+En reabastecimiento, ordenar según el P50 implica quiebre de stock en aproximadamente la mitad de los períodos; ordenar según el P90, en aproximadamente uno de cada diez, a costa de mantener mayor inventario.
+
+---
+
+## 4. Experimento 1: modelos de referencia (notebook 01)
+
+### 4.1 Modelos
+
+| Modelo | Descripción | Justificación |
+|---|---|---|
+| Naive estacional (`SeasonalNaive`) | ŷ(t) = y(t − 7) | Línea base mínima, sin parámetros. |
+| Promedio de 4 semanas (`SeasonalWindowAverage`) | Media de y(t−7), y(t−14), y(t−21) e y(t−28) | Reduce la sensibilidad a semanas atípicas. |
+| AutoETS | Suavizado exponencial (error, tendencia y estacionalidad); selecciona automáticamente la configuración de cada serie | Método estadístico estándar. |
+| Chronos-Bolt small | Modelo fundacional preentrenado (Amazon, ~48 M parámetros), utilizado *zero-shot*; entrega cuantiles | Alternativa sin entrenamiento; robusta con historial corto. |
+
+Los tres primeros pertenecen a la librería `statsforecast` (Nixtla). Chronos se obtiene de la librería `chronos-forecasting` y sus pesos de Hugging Face (`amazon/chronos-bolt-small`, 183 MB). Todas son de código abierto (licencia Apache 2.0).
+
+Métodos descartados:
+- **Croston/TSB:** orientados a demanda intermitente; el conjunto casi no presenta días sin venta.
+- **Gradient boosting:** se evalúa en el experimento 2.
+- **Ajuste fino (*fine-tuning*) de Chronos:** requiere un volumen considerable de datos reales y GPU.
+
+### 4.2 Configuración
+
+4 cortes semanales (2017-12-03, 2017-12-10, 2017-12-17 y 2017-12-24), horizonte de 7 días y 500 series: 14,000 pronósticos diarios por modelo.
+
+### 4.3 Resultados
+
+Error diario:
 
 | Modelo | MAE (unidades/día) | WAPE | Sesgo |
 |---|---|---|---|
-| **Chronos** | **6.31** | **14.2%** | +5.2% |
+| Chronos | 6.31 | 14.2% | +5.2% |
 | AutoETS | 7.05 | 15.9% | +8.3% |
-| Naive_semanal | 8.74 | 19.7% | +5.1% |
-| Promedio_4_semanas | 10.63 | 24.0% | +20.1% |
+| Naive estacional | 8.74 | 19.7% | +5.1% |
+| Promedio 4 semanas | 10.63 | 24.0% | +20.1% |
 
-### Error en el total de la semana
+Error sobre el total semanal:
 
 | Modelo | WAPE semanal |
 |---|---|
-| **Chronos** | **8.4%** |
-| Naive_semanal | 10.1% |
+| Chronos | 8.4% |
+| Naive estacional | 10.1% |
 | AutoETS | 10.9% |
-| Promedio_4_semanas | 20.5% |
+| Promedio 4 semanas | 20.5% |
 
-### Rango de Chronos (P10–P90)
+Calibración del intervalo de Chronos: cobertura P90 de 94.9% y cobertura P10–P90 de 77.1%.
 
-- Ventas reales ≤ P90: **94.9%** de los días (ideal: ~90%). Es un poco conservador, lo cual es bueno para no quedarse sin stock.
-- Ventas reales dentro de P10–P90: **77.1%** (ideal: ~80%). Está bien calibrado.
+![Ejemplo de pronóstico del experimento 1](figuras/v0.1/01_ejemplo_pronostico.png)
 
-### Cómo leer esto
+*Figura 2. Última semana evaluada (tienda1_prod1): valores observados, pronóstico de cada modelo e intervalo P10–P90 de Chronos.*
 
-1. **Chronos gana en todo, sin entrenarlo.** Se equivoca 10% menos que AutoETS y 28% menos que el naive. En el total semanal, el error es de 8.4%: para un producto que vende unas 300 unidades por semana, te equivocas por unas 25.
-2. **Todos predicen de más (sesgo positivo).** No es un error del código: las ventas de este dataset tienen un **patrón anual** (pico en julio, ~67 unidades/día; mínimo en enero, ~35) y caen de ~62 a ~44 unidades/día entre noviembre y diciembre. Los modelos que solo miran semanas recientes "creen" que sigue noviembre.
-   - Por eso `Promedio_4_semanas` queda último: promedia semanas de noviembre y predice 20% de más.
-   - Chronos mira un historial mucho más largo y capta parte de ese patrón anual.
-3. **El naive le gana a AutoETS en el total semanal**, aunque pierde en el error diario. AutoETS tiene más sesgo (+8.3%), y ese error no se compensa al sumar la semana. Por eso hay que mirar varias métricas y no solo una.
-4. **Tiempo de cómputo:** en tu PC, el notebook completo tardó **33 minutos**, y casi todo fue AutoETS (ajusta un modelo por producto por semana). Chronos predijo los 500 productos en segundos.
+Tiempo de ejecución: 33 minutos en CPU (Windows), atribuibles casi en su totalidad a AutoETS (2,000 ajustes: 500 series × 4 cortes). Chronos generó los pronósticos de las 500 series en segundos.
+
+### 4.4 Discusión
+
+1. Chronos obtiene el menor error en todas las métricas: su MAE es 10% menor que el de AutoETS y 28% menor que el del modelo naive.
+2. Todos los modelos presentan sesgo positivo. En el conjunto, la venta media pasa de ~62 unidades/día en las últimas semanas de noviembre a ~44 en diciembre, y los métodos basados en semanas recientes no anticipan esa caída estacional. El promedio de 4 semanas es el más afectado (+20.1%). Chronos utiliza un contexto histórico largo y captura parcialmente la estacionalidad anual.
+3. En el total semanal, el modelo naive supera a AutoETS a pesar de tener mayor error diario: el sesgo de AutoETS (+8.3%) no se compensa al agregar los días. Esto justifica evaluar más de una métrica.
+4. El intervalo de Chronos está razonablemente calibrado y es ligeramente conservador en el P90, lo cual es preferible para evitar quiebres de stock.
+
+### 4.5 Conclusión
+
+Se selecciona Chronos-Bolt small como modelo de referencia, y el naive estacional se mantiene como respaldo operativo y como control. La evaluación cubre un único mes con cambio estacional; el experimento 2 la extiende a todo 2017.
 
 ---
 
-## 6. Qué modelo elegir
+## 5. Experimento 2: modelos entrenados (notebook 02)
 
-**Recomendación: Chronos-Bolt small como modelo principal, y el naive semanal como respaldo.**
+### 5.1 Objetivo
 
-| Modelo | Decisión | Por qué |
+Determinar si un modelo entrenado sobre el conjunto de datos supera a Chronos, y si un modelo de tamaño compatible con el ESP32-S3 alcanza una precisión aceptable.
+
+### 5.2 Partición temporal
+
+Se define como origen *t* el último día con información disponible; con los datos hasta *t* se pronostican los días *t*+1 a *t*+7, como ocurrirá en producción.
+
+| Conjunto | Orígenes | Ejemplos (orígenes × 500 series) | Uso |
+|---|---|---|---|
+| Entrenamiento | diarios, 2014–2015 (697) | 348,500 | Ajuste de parámetros |
+| Validación | diarios, 2016 (360) | 180,000 | Parada temprana |
+| Prueba | semanales, 2017 (52) | 26,000 | Evaluación final, una sola vez |
+
+- El entrenamiento inicia el 2014-01-27 porque cada origen requiere 28 días de historial reciente y un año adicional para la variable de estacionalidad anual.
+- Ningún objetivo de entrenamiento pertenece a 2016 ni ningún objetivo de validación a 2017; el notebook lo verifica con un `assert`.
+- Las cuatro últimas semanas de prueba coinciden con los cortes del experimento 1. Como control, el MAE del modelo naive en esas semanas debe ser 8.74; este valor se verificó.
+- Se excluyen AutoETS (su tiempo de ejecución sobre 52 semanas sería de varias horas) y el promedio de 4 semanas (último lugar en el experimento 1).
+
+### 5.3 Variables de entrada
+
+Para cada serie y cada origen *t* se construye un vector de 42 variables:
+
+| Variables | Cantidad | Justificación |
 |---|---|---|
-| Chronos | **Usar** | El mejor en todas las métricas, el más rápido, da el P90 y no hay que entrenarlo. |
-| Naive_semanal | **Respaldo** | Es una línea de código. Si Chronos no carga en la Pi o falla, el sistema sigue dando un número razonable. También sirve para vigilar: si un día Chronos empieza a perder contra el naive con tus datos reales, algo cambió. |
-| AutoETS | Descartar | Segundo en error diario, pero lento y con más sesgo. No justifica el tiempo. |
-| Promedio_4_semanas | Descartar | El peor: se queda atrás cuando cambia la temporada. |
+| Rezagos *t*−27 … *t*, divididos por la escala | 28 | Nivel actual y patrón semanal reciente. |
+| Misma semana del año anterior, dividida por la media de los 28 días previos a esa semana | 7 | Incorpora la estacionalidad anual, que no se observa en una ventana de 28 días. |
+| Indicadores (*one-hot*) del día de la semana de *t*+1 | 7 | Ubican cada posición del horizonte en el ciclo semanal. |
 
-**Frase para tu reporte:**
-> "Comparé 4 métodos con backtesting sobre 500 series reales de Kaggle. Chronos-Bolt sin entrenar obtuvo el menor error (WAPE semanal de 8.4%, contra 10.1% del naive semanal y 10.9% de AutoETS), da un rango de confianza calibrado y corre en segundos en CPU. Por eso lo usamos en el servicio de la Raspberry Pi, con el naive semanal como respaldo."
+La **escala** es la media de los últimos 28 días de la serie. La variable objetivo son las ventas de *t*+1 a *t*+7 divididas por la escala, y las predicciones se multiplican por ella para expresarlas en unidades. La normalización permite entrenar un único modelo global sobre series de distinto volumen.
 
-**Limitación (ponla en el reporte):** solo evaluamos diciembre de 2017, y diciembre trae una caída de temporada. Para estar más seguro, evalúa otros meses (sube `N_WINDOWS`, aunque AutoETS tardará más) y, sobre todo, repite la comparación cuando tengas datos reales de tu almacén.
+Se excluyen deliberadamente:
+- **El identificador del producto:** el modelo aprendería niveles de venta específicos de este conjunto.
+- **La fecha calendario** (mes, día del año): el modelo aprendería el calendario de este conjunto. La variable "misma semana del año anterior" obtiene la estacionalidad de la propia serie y es aplicable a cualquier negocio.
+
+Con estas decisiones, el modelo es transferible a otros inventarios.
+
+**Simplificación conocida:** las series con media inferior a 1 unidad/día no se normalizan (escala = 1). Está señalada en el código con `shortcut:` y debe revisarse con datos reales de demanda intermitente.
+
+### 5.4 LightGBM
+
+Modelo de *gradient boosting* sobre árboles de decisión: cada árbol nuevo se ajusta a los errores residuales de los anteriores. Se entrena un modelo por cada día del horizonte (estrategia directa, 7 modelos), guardados en `ml/models/v0.1/lightgbm_dia1.txt` … `lightgbm_dia7.txt`.
+
+| Hiperparámetro | Valor | Función |
+|---|---|---|
+| `objective` | `l1` | Minimiza el error absoluto; el estimador resultante es la mediana (P50), comparable con Chronos. |
+| `learning_rate` | 0.05 | Peso de la corrección aportada por cada árbol. |
+| `num_leaves` | 31 | Complejidad máxima de cada árbol. |
+| `min_data_in_leaf` | 200 | Mínimo de ejemplos por hoja; limita el sobreajuste. |
+| `feature_fraction` | 0.8 | Fracción de variables muestreadas por árbol; limita el sobreajuste. |
+
+- **Parada temprana:** se agregan árboles (máximo 2,000) mientras el error de validación disminuye; el entrenamiento se detiene tras 50 iteraciones sin mejora.
+- **Reentrenamiento final:** sobre 2014–2016, con el número de árboles seleccionado.
+
+### 5.5 Red neuronal (MLP)
+
+```
+42 entradas → Dense(64, ReLU) → Dense(32, ReLU) → 7 salidas (t+1 … t+7)
+```
+
+- **Parámetros:** (42×64 + 64) + (64×32 + 32) + (32×7 + 7) = 5,063. Ocupan aprox. 20 KB en float32 y 5 KB en int8, dentro de la capacidad del ESP32-S3.
+- **Selección de arquitectura:** con variables de entrada ya construidas, un perceptrón multicapa es suficiente. Las capas densas tienen soporte completo en TensorFlow Lite Micro; el soporte de capas recurrentes (LSTM) en microcontroladores es limitado.
+- **Entrenamiento:** función de pérdida MAE (estima la mediana, por consistencia con LightGBM), optimizador Adam con tasa de aprendizaje 1e-3, lotes de 512 ejemplos y semilla fija (42).
+- **Parada temprana:** paciencia de 5 épocas sobre la validación, con un máximo de 100 épocas. Luego se reentrena desde cero sobre 2014–2016 con el número de épocas seleccionado.
+- **Diagnóstico:** el notebook grafica la curva de aprendizaje. Un aumento del error de validación mientras disminuye el de entrenamiento indica sobreajuste.
+
+### 5.6 Implementación
+
+Keras se ejecuta sobre PyTorch (`KERAS_BACKEND="torch"`), que ya forma parte del entorno por Chronos; esto evita instalar TensorFlow en esta etapa. El archivo `ml/models/v0.1/red.keras` es independiente del backend, de modo que el notebook 03 podrá cargarlo con TensorFlow para la cuantización a int8. Se verificó que TensorFlow 2.21 es instalable en Python 3.13.
+
+### 5.7 Alcance de esta versión
+
+- LightGBM y la red pronostican solo la mediana. Para obtener el P90 se entrenarían con `objective="quantile"` (LightGBM) o con una función de pérdida *pinball* (red).
+- Los hiperparámetros corresponden a valores estándar. Su ajuste, de realizarse, debe hacerse contra la validación de 2016 y nunca contra la prueba de 2017.
+
+### 5.8 Resultados
+
+Ejecución completa sobre las 52 semanas de 2017 y las 500 series (182,000 pronósticos diarios por modelo), en aprox. 10 minutos: Chronos y el MLP en GPU (RTX 3050), LightGBM en CPU. El control de consistencia se cumple: el MAE del modelo naive en diciembre es 8.74, igual que en el experimento 1.
+
+| Modelo | MAE (unidades/día) | WAPE | Sesgo | WAPE semanal | Tamaño |
+|---|---|---|---|---|---|
+| LightGBM | 6.41 | 10.9% | −0.3% | 5.2% | 8,861 KB |
+| MLP | 6.45 | 11.0% | −0.7% | 5.3% | 20 KB (float32) |
+| Chronos | 7.01 | 11.9% | −1.3% | 6.5% | 183,000 KB |
+| Naive estacional | 8.84 | 15.0% | −0.1% | 6.5% | 0 |
+
+**Entrenamiento.**
+- **LightGBM:** la parada temprana seleccionó entre 310 árboles (día 1) y 521 (día 6), con 2,923 en total. El número de árboles crece con el horizonte, lo que es coherente con la mayor dificultad de pronosticar días más lejanos.
+- **MLP:** la mejor época fue la 11, y el entrenamiento se detuvo en la 16. En la curva de aprendizaje, el error de entrenamiento desciende en la primera época y se estabiliza en ~0.132; el de validación permanece estable entre 0.127 y 0.129, sin tendencia creciente, por lo que no hay evidencia de sobreajuste.
+- El error de validación es menor que el de entrenamiento. La explicación probable es el crecimiento del volumen de ventas (media diaria de 50.1 en 2014 y 52.3 en 2015, frente a 56.6 en 2016): a mayor volumen, menor ruido relativo en la escala normalizada.
+
+![Curva de aprendizaje del MLP](figuras/v0.1/02_curva_aprendizaje.png)
+
+*Figura 3. Curva de aprendizaje del MLP: MAE en escala normalizada por época, para entrenamiento (2014–2015) y validación (2016).*
+
+**Error por mes.**
+- Los modelos entrenados mantienen un WAPE semanal entre 4.3% y 6.6% durante todo el año.
+- El naive estacional aumenta en los cambios de temporada (febrero, y de octubre a diciembre, con un máximo de 10.1% en diciembre).
+- Chronos es competitivo entre marzo y septiembre (es el mejor en marzo, mayo y agosto), pero se degrada de octubre a diciembre (9.5%, 10.0% y 8.5%), cuando la venta cae por estacionalidad anual.
+
+![WAPE semanal por mes](figuras/v0.1/02_wape_por_mes.png)
+
+*Figura 4. WAPE semanal promedio por mes en 2017, por modelo.*
+
+![Serie de ejemplo en 2017](figuras/v0.1/02_serie_ejemplo_2017.png)
+
+*Figura 5. Total semanal observado y pronosticado para tienda10_prod1 durante 2017.*
+
+**Discusión.**
+1. Los dos modelos entrenados superan a ambas referencias en todas las métricas. Su WAPE semanal (5.2–5.3%) es aprox. 20% menor que el de Chronos y el naive (6.5%).
+2. La diferencia entre LightGBM y el MLP es despreciable (0.1 puntos porcentuales en WAPE semanal), pero el MLP ocupa aprox. 440 veces menos memoria (20 KB frente a 8.9 MB). El MLP es el candidato para el ESP32-S3.
+3. Chronos supera al naive en el error diario (11.9% frente a 15.0%), pero lo iguala en el total semanal. La ventaja de los modelos entrenados se concentra en los meses de cambio estacional, que anticipan mediante la variable "misma semana del año anterior".
+4. Sobre el año completo, el sesgo de todos los modelos es cercano a cero. El sesgo positivo del experimento 1 era propio de diciembre.
+5. El experimento 1, limitado a diciembre, favorecía a Chronos; la evaluación anual modifica esa conclusión. Esto confirma la necesidad de evaluar sobre un período que cubra todas las temporadas.
+6. Los modelos entrenados aprendieron de la misma distribución que el conjunto de prueba, mientras que Chronos se usa sin entrenamiento. Con datos reales deberán reentrenarse, y requieren al menos un año de historial para la variable anual; Chronos no tiene esa restricción.
+
+**Conclusión.**
+
+| Uso | Modelo |
+|---|---|
+| ESP32-S3 | MLP, sujeto a la reevaluación tras la cuantización int8 (notebook 03) |
+| Raspberry Pi | LightGBM o MLP (desempeño equivalente); se sugiere el MLP para mantener un único modelo en ambos dispositivos |
+| Productos con menos de un año de historial | Chronos |
+| Control | Naive estacional |
+
+**Limitaciones.**
+- Hiperparámetros sin ajustar.
+- Pronóstico solo de la mediana.
+- Un único conjunto de datos, de carácter limpio.
+- No se evaluó la significancia estadística de la diferencia entre LightGBM y el MLP.
 
 ---
 
-## 7. Cómo correr el notebook
+## 6. Integración y despliegue
 
-Desde la raíz del repo, en PowerShell:
+### 6.1 Servicio en la Raspberry Pi
+
+Un script (`ml/forecast.py`) ejecutado una vez al día (cron o automatización de Home Assistant) leerá el historial de salidas, generará el pronóstico de los 7 días siguientes y publicará un sensor por producto (por ejemplo, `sensor.pronostico_arroz_7d`) con el P50 y el P90 como atributos, mediante la API REST de Home Assistant o MQTT. El agente conversacional (Ollama) consultará esos sensores.
+
+En el notebook 01, `total_p90` es la suma de los P90 diarios y no el P90 del total semanal. Como los errores diarios se compensan parcialmente, la suma es mayor y constituye una estimación conservadora.
+
+### 6.2 Rol del ESP32-S3
+
+| | Raspberry Pi | ESP32-S3 |
+|---|---|---|
+| Tipo | Computadora de placa única (Linux) | Microcontrolador |
+| Memoria | 2–8 GB | Unos pocos MB |
+| Ejecuta Python / Chronos | Sí | No |
+| Función en el sistema | Home Assistant, pronóstico, base de datos | Cámara, sensores y control local |
+
+La especificación del proyecto asigna el pronóstico a un servicio Python. Se interpreta que el modelo TinyML del ESP32-S3 corresponde al registro de salidas (detección o conteo de productos), lo cual está pendiente de confirmar con el equipo.
+
+Si se requiere ejecutar el pronóstico en el ESP32-S3, las alternativas son el MLP cuantizado a int8 con TensorFlow Lite Micro (notebook 03) o LightGBM convertido a código C (por ejemplo, con `m2cgen`). En ambos casos, el ESP32 debe almacenar los últimos 28 días de cada producto, y el modelo solo se justifica si supera al naive estacional.
+
+---
+
+## 7. Consideraciones para datos reales
+
+1. **Salidas y demanda:** cuando un producto se agota, las salidas registradas son cero aunque exista demanda. Entrenar con esos registros sesga el modelo hacia la subestimación. Se recomienda registrar el stock diario y excluir los días con stock cero.
+2. **Productos nuevos:** las variables de entrada requieren al menos 28 días de historial (y un año para la variable anual). Mientras tanto se utiliza Chronos o el naive estacional.
+3. **Feriados y promociones:** el conjunto de Kaggle no los registra. Si el negocio los presenta, deben incorporarse como variables (por ejemplo, con Chronos-2 o LightGBM).
+4. **Demanda intermitente:** para productos de venta esporádica deben evaluarse Croston/TSB (`statsforecast.models.CrostonOptimized`) y revisarse la normalización descrita en la sección 5.3.
+
+---
+
+## 8. Reproducibilidad
+
+**Entorno:** Python 3.13, dependencias en `ml/requirements.txt`. Desde la raíz del repositorio:
 
 ```powershell
 python -m venv .venv
@@ -227,139 +353,31 @@ python -m venv .venv
 pip install -r ml/requirements.txt
 ```
 
-Luego abre `ml/notebooks/01_pronostico_7_dias.ipynb` en VS Code, elige el kernel de `.venv` y dale a **Run All**.
-Si prefieres Jupyter en el navegador: `pip install jupyterlab` y luego `jupyter lab`.
+**Aceleración por GPU (opcional):** `requirements.txt` instala PyTorch para CPU, que es la configuración de la Raspberry Pi. En un equipo con GPU NVIDIA (driver compatible con CUDA 13.2 o superior) puede reemplazarse por la versión con CUDA:
 
-Notas:
-- **Tarda ~33 minutos completo**, casi todo por AutoETS. Si solo quieres ver Chronos, borra la línea de `AutoETS(...)` en la sección 3 y la palabra `"AutoETS"` de la lista `modelos` en la sección 5: así corre en pocos minutos.
-- La primera vez descarga el modelo de Chronos (~200 MB) desde Hugging Face. Después queda guardado en caché.
-- Usé `n_jobs=1` en `StatsForecast`: en Windows, con `n_jobs=-1`, los procesos en paralelo se quedan colgados. En la Raspberry Pi (Linux) puedes probar `n_jobs=-1` para que vaya más rápido.
-
----
-
-## 8. ¿Y el TinyML del ESP32-S3?
-
-El README principal dice que la predicción corre en el ESP32-S3 con TinyML, pero la tabla de la tarea asigna el pronóstico a un **"Python forecasting service"**. Mi interpretación:
-
-- **El TinyML va en la cámara del ESP32-S3**, para detectar o contar productos que salen. Eso **genera** el historial.
-- **El pronóstico va en Python en la Raspberry Pi**, que es este notebook.
-
-Razones: Chronos no cabe en un ESP32 (que tiene unos pocos MB de memoria), y predecir 7 días una vez al día no necesita velocidad ni correr sin conexión en el chip.
-
-**Confírmalo con tu profe o tu equipo.** Si te exigen que la predicción corra en el ESP32, la opción es una red neuronal pequeña (últimos 28 días → próximos 7) cuantizada a int8 con TensorFlow Lite Micro. Y la comparas en esta misma tabla contra `Naive_semanal`: si no le gana, no tiene sentido ponerla.
-
----
-
-## 9. Cosas que en datos reales sí te van a pasar
-
-1. **Salidas ≠ demanda.** Si un producto se agotó, las salidas de ese día son 0, pero la gente sí quería comprar. Si entrenas con esos ceros, el modelo aprende a predecir de menos. Solución: guarda también el stock de cada día y saca del historial los días con stock en cero.
-2. **Productos nuevos.** Sin historial, ningún modelo estadístico funciona bien. Chronos o el promedio de las primeras semanas son lo mejor que hay al inicio.
-3. **Feriados y promociones.** Este dataset no los marca. Si tu almacén los tiene, anótalos: son la principal razón para pasar a Chronos-2 o LightGBM, que aceptan esas variables.
-
----
-
-## 10. Siguientes pasos
-
-1. **Validar con el equipo** quién hace qué (sección 8).
-2. **Definir la tabla de salidas** en la base de datos, por ejemplo: `salidas(fecha, producto_id, cantidad, stock_restante)`.
-3. **Convertir la sección 7 del notebook en un script** (`ml/forecast.py`) que la Raspberry Pi corra todos los días (con cron o con una automatización de Home Assistant) y publique un sensor por producto, por ejemplo `sensor.pronostico_arroz_7d`, con la P50 y la P90 como atributos, vía la API REST de Home Assistant o MQTT.
-   Ojo: en el notebook, `total_p90` es la **suma de los P90 de cada día**, no el P90 de la semana. Como los errores diarios se compensan en parte, esa suma es más alta: es un número conservador para reabastecer.
-4. **El agente de Ollama** lee esos sensores y responde preguntas en lenguaje natural.
-
----
----
-
-# Parte 2 · Notebook 02: modelos entrenados por nosotros
-
-`02_comparacion_2017.ipynb` agrega dos modelos que **entrenamos nosotros** (LightGBM y una red neuronal pequeña) y los pone a competir contra Naive semanal y Chronos con un examen más grande.
-
-## 11. Qué cambia respecto al notebook 01
-
-| | Notebook 01 | Notebook 02 |
-|---|---|---|
-| Examen | 4 semanas (diciembre 2017) | **52 semanas (todo 2017)** |
-| Partición | todo lo anterior a cada corte | **por años**: entrenar 2014–2015, validar 2016, probar 2017 |
-| Modelos | 4 de librería | Naive, Chronos + **2 entrenados por nosotros** |
-| Fuera | – | AutoETS (tardaría horas en 52 semanas) y Promedio 4 semanas (fue el peor en el 01) |
-
-Las 4 últimas semanas del examen son **las mismas del notebook 01**. Por eso el notebook imprime un control: el MAE del naive en diciembre debe dar **8.74**, igual que en el 01. Ya lo verifiqué: da 8.74.
-
-## 12. Orígenes: cómo se arma cada ejemplo
-
-Un **origen** es "el último día que conocemos". Con los datos hasta ese día se predicen los 7 siguientes. Es lo mismo que hará el sistema real: cada día, "hoy" es el origen.
-
-| Parte | Orígenes | Ejemplos (orígenes × 500 productos) |
-|---|---|---|
-| Entrenamiento | cada día de 2014–2015 (697) | 348,500 |
-| Validación | cada día de 2016 (360) | 180,000 |
-| Prueba | uno por semana de 2017 (52) | 26,000 |
-
-El entrenamiento empieza a fines de enero de 2014, y no en 2013, porque cada ejemplo necesita 28 días recientes **más un año** de historia para la pista "hace un año".
-
-Ningún objetivo de entrenamiento cae en 2016 y ninguno de validación cae en 2017. El notebook lo comprueba con un `assert`.
-
-## 13. Las 42 pistas y por qué cada una
-
-| Pistas | Cuántas | Por qué |
-|---|---|---|
-| **Últimos 28 días** ÷ escala | 28 | El nivel actual y el patrón semanal reciente. |
-| **La misma semana hace un año** ÷ el promedio de las 4 semanas previas de ese año | 7 | Es la única forma de ver el **patrón anual** (lo que les faltó a los modelos simples en diciembre). Le dice al modelo "el año pasado, esta semana fue 0.75 veces lo normal". |
-| **Día de la semana** del primer día a predecir | 7 | Para que sepa en qué posición cae el sábado. Va como siete 0/1 (*one-hot*). |
-
-**Escala** = promedio de los últimos 28 días del producto. Todo se divide entre ella, y la predicción se multiplica de vuelta al final.
-
-**Lo que NO le damos, a propósito:**
-- **El nombre o número del producto.** Si lo tuviera, aprendería "el producto 15 vende 60", y eso no sirve en tu almacén.
-- **La fecha del año** (mes, día del año). Aprendería el calendario de *este* dataset de Kaggle. "Hace un año" en cambio funciona con el calendario de cualquier negocio.
-
-Con esas dos decisiones, el modelo aprende **formas** y no tamaños ni fechas, y por eso se puede aplicar a **cualquier inventario**.
-
-**Atajo conocido:** si un producto vende menos de 1 unidad por día en promedio, no se normaliza (se divide entre 1). Está marcado en el código con `shortcut:`. Hay que revisarlo con tus datos reales si tienes productos de venta muy esporádica.
-
-## 14. Diseño de LightGBM
-
-- **7 modelos**, uno por cada día a predecir (día 1 … día 7). Es la forma más simple de que LightGBM, que predice un solo número, entregue 7. Se guardan en `ml/models/lightgbm_dia1.txt` … `lightgbm_dia7.txt`.
-- **`objective="l1"`**: minimiza el error absoluto, y eso lleva a predecir la **mediana (P50)**, lo mismo que comparamos de Chronos.
-
-| Perilla | Valor | Qué controla |
-|---|---|---|
-| `learning_rate` | 0.05 | Cuánto corrige cada árbol nuevo. Más bajo: aprende más lento pero más fino. |
-| `num_leaves` | 31 | Qué tan complejo puede ser cada árbol. |
-| `min_data_in_leaf` | 200 | Cada decisión final debe apoyarse en al menos 200 ejemplos. Evita que memorice casos raros. |
-| `feature_fraction` | 0.8 | Cada árbol ve el 80% de las pistas al azar. Otra defensa contra memorizar. |
-
-- **Early stopping (aquí se usa la validación):** agrega árboles mientras mejore en 2016. Si pasan 50 rondas sin mejorar, para. El notebook imprime cuántos árboles quedaron por día.
-- **Reentrenamiento final:** con el número de árboles elegido, se entrena otra vez con 2014–2016, para que también aprenda de 2016.
-
-## 15. Diseño de la red neuronal
-
-```
-42 pistas → [64 neuronas, ReLU] → [32 neuronas, ReLU] → 7 salidas (día 1 … día 7)
+```powershell
+pip install "torch==2.15.0+cu132" --index-url https://download.pytorch.org/whl/cu132 --force-reinstall --no-deps
 ```
 
-- **Parámetros:** (42×64 + 64) + (64×32 + 32) + (32×7 + 7) = **5,063**. Son unos 20 KB en float32 y unos 5 KB en int8: cabe de sobra en el ESP32-S3.
-- **¿Por qué un MLP (capas densas) y no LSTM u otra red más "de series de tiempo"?** Con 42 pistas ya preparadas, un MLP alcanza. Además, TensorFlow Lite Micro soporta las capas densas sin problemas, mientras que el soporte de LSTM en microcontroladores es limitado. Y es la red más fácil de explicar.
-- **`loss="mae"`**: igual que LightGBM, aprende la mediana.
-- **Adam con `learning_rate=1e-3`, `batch_size=512`**: valores estándar para empezar.
-- **Early stopping con `patience=5`:** si el error en 2016 no mejora en 5 épocas, para y se queda con la mejor. Luego se reentrena **desde cero** con 2014–2016 durante esas mismas épocas.
-- **Curva de aprendizaje:** el notebook la dibuja. Si la línea de validación sube mientras la de entrenamiento baja, la red está memorizando (*overfitting*).
-- **Keras sobre PyTorch:** Keras puede funcionar sobre PyTorch o sobre TensorFlow. Uso PyTorch porque ya está instalado (lo trajo Chronos) y así no instalamos TensorFlow (~400 MB) todavía. El archivo `ml/models/red.keras` sirve para los dos, y el **notebook 03** lo abrirá con TensorFlow para convertirlo a int8. Ya comprobé que TensorFlow 2.21 se instala en tu Python 3.13.
+Con esta versión, Chronos y Keras utilizan la GPU automáticamente. LightGBM se ejecuta en CPU, porque la distribución de PyPI no incluye soporte de GPU.
 
-## 16. Lo que quedó fuera en esta versión
+**Ejecución:** abrir el notebook en VS Code, seleccionar el kernel `.venv` y ejecutar *Run All*. La ejecución es local; la única conexión externa es la descarga de los pesos de Chronos desde Hugging Face, que quedan en caché tras la primera ejecución.
 
-- **P90 de LightGBM y de la red:** por ahora solo predicen la mediana. Para que den P90 se entrenan con `objective="quantile"` (LightGBM) o con una pérdida *pinball* (la red). Es el siguiente paso si la comparación lo pide.
-- **Afinar perillas:** usé valores estándar. Si LightGBM o la red quedan cerca de Chronos, vale la pena probar otras combinaciones contra la validación de 2016 (nunca contra 2017).
+| Notebook | Tiempo (Windows; GPU RTX 3050 6 GB) |
+|---|---|
+| 01 | 33 min en CPU (medido) |
+| 02, `PRUEBA_RAPIDA = True` | 3.5 min en CPU (medido) |
+| 02, completo | ~10 min con GPU (medido); ~1 h solo con CPU (estimado) |
 
-## 17. Cómo correrlo
+Inferencia de Chronos para 500 series y una semana (medido): 0.8 s en GPU y 42 s en CPU. El valor en CPU es la referencia para la Raspberry Pi, que no dispone de GPU.
 
-1. Pon `PRUEBA_RAPIDA = True` en la primera celda de código y dale a **Run All**. Usa 20 productos y entrenamientos cortos, y en tu PC tardó **3.5 minutos**. Sirve para comprobar que todo funciona.
-2. Vuelve a `PRUEBA_RAPIDA = False` y corre todo otra vez.
-   - Chronos tarda **~42 segundos por semana** con los 500 productos, así que **~36 minutos** las 52 semanas.
-   - LightGBM y la red no los he medido con los 500 productos; estimo de 10 a 20 minutos entre los dos.
-   - En total, **alrededor de una hora**.
+En Windows, `StatsForecast` se configura con `n_jobs=1`, porque la ejecución en paralelo (`n_jobs=-1`) deja procesos bloqueados. En la Raspberry Pi (Linux) puede evaluarse `n_jobs=-1`.
 
-Los modelos entrenados quedan en `ml/models/`.
+---
 
-## 18. Resultados
+## 9. Próximos pasos
 
-_Pendiente: se llenan después de la corrida completa._ Los números de la prueba rápida no se anotan: con 20 productos y 2 épocas no significan nada.
+1. Notebook 03: cuantización int8 del MLP, reevaluación sobre 2017 y exportación para el firmware. El MLP supera al naive estacional (sección 5.8), condición establecida para este paso.
+2. Confirmar con el equipo el rol del ESP32-S3 (sección 6.2).
+3. Definir la tabla de salidas en la base de datos, por ejemplo: `salidas(fecha, producto_id, cantidad, stock_restante)`.
+4. Implementar el servicio `ml/forecast.py`.
