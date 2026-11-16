@@ -7,3 +7,7 @@ firmware/include/secrets.h
 
 # Modelos LightGBM (8.9 MB por versión, se regeneran con el notebook 02); red.keras sí se versiona
 ml/models/**/lightgbm_*.txt
+
+# Servicio de inventario: configuración local y base de datos
+servicio/.env
+*.db

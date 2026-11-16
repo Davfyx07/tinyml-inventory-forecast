@@ -1,0 +1,19 @@
+# El servicio de inventario publica un texto en inventario/alerta cuando las unidades a comprar
+# de un producto pasan de 0 a más (el pronóstico de 7 días supera el stock).
+alias: "Inventario: alerta de reabastecimiento"
+description: Muestra la alerta del servicio de inventario en Home Assistant y en el celular.
+mode: queued
+triggers:
+  - trigger: mqtt
+    topic: inventario/alerta
+actions:
+  - action: persistent_notification.create
+    data:
+      title: Reabastecimiento
+      message: "{{ trigger.payload }}"
+  # Para recibirla en el celular (con la app de Home Assistant instalada), quita los # de las 4 líneas
+  # siguientes y cambia "tu_celular" por el nombre que aparece en Herramientas para desarrolladores → Acciones.
+  # - action: notify.mobile_app_tu_celular
+  #   data:
+  #     title: Reabastecimiento
+  #     message: "{{ trigger.payload }}"

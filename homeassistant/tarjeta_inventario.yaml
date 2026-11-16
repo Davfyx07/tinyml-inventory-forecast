@@ -1,0 +1,22 @@
+# Tarjeta del dashboard: formulario de movimientos y tabla de todos los productos.
+# Se pega en un tablero: Configuración → Tableros → Agregar tablero → lápiz → Agregar tarjeta → Manual.
+type: vertical-stack
+cards:
+  - type: entities
+    title: Registrar movimiento
+    entities:
+      - select.inventario_producto
+      - number.inventario_cantidad
+      - button.registrar_venta
+      - button.registrar_entrada
+      - sensor.inventario_ultimo_movimiento
+  - type: markdown
+    title: Inventario
+    content: |
+      | Producto | Stock | Pronóstico 7 días | Comprar |
+      |:---|---:|---:|---:|
+      {% for s in states.sensor if s.entity_id.startswith('sensor.stock_') and s.attributes.producto is defined %}| {{ s.attributes.producto }} | {{ s.state }} | {{ s.attributes.pronostico_7d if s.attributes.pronostico_7d is not none else '—' }} | {{ s.attributes.comprar if s.attributes.comprar is not none else '—' }} |
+      {% endfor %}
+  - type: entities
+    entities:
+      - button.recalcular_pronostico
