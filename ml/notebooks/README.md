@@ -6,6 +6,7 @@ Documentación técnica de los experimentos contenidos en `ml/notebooks/`.
 |---|---|---|
 | `01_pronostico_7_dias.ipynb` | Experimento 1: modelos de referencia, evaluados en 4 semanas de diciembre de 2017 | Ejecutado |
 | `02_comparacion_2017.ipynb` | Experimento 2: modelos entrenados (LightGBM y MLP), evaluados en las 52 semanas de 2017 | Ejecutado |
+| `03_cuantizacion_int8.ipynb` | Cuantización int8 del MLP, reevaluación sobre 2017, exportación para el firmware y vectores de prueba | Ejecutado |
 
 **Versión documentada: v0.1** (primer entrenamiento). Los resultados, las figuras y los modelos descritos en este documento corresponden a esta versión:
 
@@ -14,6 +15,7 @@ Documentación técnica de los experimentos contenidos en `ml/notebooks/`.
 | Figuras | `ml/notebooks/figuras/v0.1/` |
 | MLP entrenado | `ml/models/v0.1/red.keras` (versionado en el repositorio) |
 | Modelos LightGBM | `ml/models/v0.1/lightgbm_dia1.txt` … `lightgbm_dia7.txt` (excluidos del repositorio por tamaño; se regeneran ejecutando el notebook 02) |
+| MLP int8 (v0.2, notebook 03) | `ml/models/v0.2/red_int8.tflite` y `firmware/include/model_data.h` |
 
 Las versiones posteriores guardarán sus artefactos en carpetas propias (`v0.2/`, …), definidas por la constante `VERSION` del notebook 02.
 
@@ -311,26 +313,36 @@ Ejecución completa sobre las 52 semanas de 2017 y las 500 series (182,000 pron�
 
 ---
 
-## 6. Integración y despliegue
+## 6. Cuantización e integración
 
-### 6.1 Servicio en la Raspberry Pi
+### 6.1 Cuantización int8 (notebook 03)
 
-Un script (`ml/forecast.py`) ejecutado una vez al día (cron o automatización de Home Assistant) leerá el historial de salidas, generará el pronóstico de los 7 días siguientes y publicará un sensor por producto (por ejemplo, `sensor.pronostico_arroz_7d`) con el P50 y el P90 como atributos, mediante la API REST de Home Assistant o MQTT. El agente conversacional (Ollama) consultará esos sensores.
+El MLP se convierte a TensorFlow Lite con cuantización entera completa (pesos, activaciones, entrada y salida en int8), calibrada con 1000 filas del período de entrenamiento. Los pesos de las capas densas se cuantizan con una escala por capa (*per-tensor*): la versión de TensorFlow Lite Micro de la librería `tflm_esp32` no admite escalas por neurona (*per-channel*) en `FULLY_CONNECTED`, y el firmware fallaba al preparar el modelo.
 
-En el notebook 01, `total_p90` es la suma de los P90 diarios y no el P90 del total semanal. Como los errores diarios se compensan parcialmente, la suma es mayor y constituye una estimación conservadora.
-
-### 6.2 Rol del ESP32-S3
-
-| | Raspberry Pi | ESP32-S3 |
+| Modelo | WAPE semanal (2017) | Tamaño |
 |---|---|---|
-| Tipo | Computadora de placa única (Linux) | Microcontrolador |
-| Memoria | 2–8 GB | Unos pocos MB |
-| Ejecuta Python / Chronos | Sí | No |
-| Función en el sistema | Home Assistant, pronóstico, base de datos | Cámara, sensores y control local |
+| MLP float32 (v0.1) | 5.28 % | 20,252 bytes (pesos) |
+| MLP int8, escala por neurona | 5.27 % | 10,144 bytes (archivo); no ejecutable en el ESP32 |
+| MLP int8, escala por capa (v0.2) | 5.28 % | 7,744 bytes (archivo) |
 
-La especificación del proyecto asigna el pronóstico a un servicio Python. Se interpreta que el modelo TinyML del ESP32-S3 corresponde al registro de salidas (detección o conteo de productos), lo cual está pendiente de confirmar con el equipo.
+Limitación: el rango representable se fija en la calibración. La entrada admite hasta 2.27 veces el promedio de los últimos 28 días y la salida hasta 1.37 veces; los valores superiores se saturan.
 
-Si se requiere ejecutar el pronóstico en el ESP32-S3, las alternativas son el MLP cuantizado a int8 con TensorFlow Lite Micro (notebook 03) o LightGBM convertido a código C (por ejemplo, con `m2cgen`). En ambos casos, el ESP32 debe almacenar los últimos 28 días de cada producto, y el modelo solo se justifica si supera al naive estacional.
+### 6.2 Ejecución en el ESP32-S3
+
+El firmware (`firmware/`) recibe por MQTT el historial crudo de cada producto, construye las 42 variables de entrada igual que `armar_pistas()`, ejecuta el modelo con TensorFlow Lite Micro y publica el pronóstico. Al iniciar compara su resultado con 5 vectores de prueba generados por el notebook 03 (productos y días de la semana distintos).
+
+| Medida (ESP32-S3, 240 MHz, 2026-11-15) | Valor |
+|---|---|
+| Vectores de prueba que coinciden con Python | 5 de 5 (diferencia máxima 0.000) |
+| Tiempo por pronóstico, incluida la construcción de las entradas | 0.49 ms (promedio de 100 ejecuciones) |
+| Memoria de trabajo de TFLite Micro (arena) | 780 bytes |
+| Modelo en flash | 7,744 bytes |
+
+### 6.3 Arquitectura del sistema
+
+El pronóstico se ejecuta en el ESP32-S3. Un servicio en Python (`servicio/`) guarda los movimientos de inventario en SQLite, envía cada día el historial al ESP32 y publica el stock, el pronóstico y las unidades a comprar en Home Assistant, donde un agente conversacional local (Ollama) responde preguntas sobre esos datos. La descripción completa está en `docs/arquitectura.md`.
+
+En el notebook 01, `total_p90` es la suma de los P90 diarios y no el P90 del total semanal. Como los errores diarios se compensan parcialmente, la suma es mayor y constituye una estimación conservadora. El sistema actual usa solo el pronóstico puntual del MLP.
 
 ---
 
@@ -377,7 +389,6 @@ En Windows, `StatsForecast` se configura con `n_jobs=1`, porque la ejecución en
 
 ## 9. Próximos pasos
 
-1. Notebook 03: cuantización int8 del MLP, reevaluación sobre 2017 y exportación para el firmware. El MLP supera al naive estacional (sección 5.8), condición establecida para este paso.
-2. Confirmar con el equipo el rol del ESP32-S3 (sección 6.2).
-3. Definir la tabla de salidas en la base de datos, por ejemplo: `salidas(fecha, producto_id, cantidad, stock_restante)`.
-4. Implementar el servicio `ml/forecast.py`.
+1. Empaquetar el servicio de inventario como aplicación de Home Assistant para ejecutarlo en la Raspberry Pi.
+2. Registrar datos de una tienda real y evaluar el modelo con ellos; recalibrar la cuantización si hay picos de demanda por encima del rango representable (sección 6.1).
+3. Evaluar un pronóstico probabilístico (P90) para el cálculo de compras.

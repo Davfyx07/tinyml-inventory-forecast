@@ -282,7 +282,7 @@ Lectura:
 - Datos limpios: con datos reales habrá productos agotados, que registran 0 ventas aunque haya demanda.
 - Solo pronostica la mediana (el valor central), no un rango.
 - Hiperparámetros sin ajustar (valores estándar).
-- Falta comprobar que la versión int8 mantiene la precisión (notebook 03).
+- La versión int8 (notebook 03) mantiene la precisión (WAPE semanal 5.28 %, igual que en float32), pero solo representa pronósticos de hasta 1.37 veces el promedio de los últimos 28 días; los valores superiores se recortan.
 
 ## 10. Preguntas probables del profesor
 
